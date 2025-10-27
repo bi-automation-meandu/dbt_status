@@ -1,174 +1,151 @@
-name: dbt status to Slack
+name: dbt status to Slack (Discovery API)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
   dbt-status-check:
     runs-on: ubuntu-latest
     env:
-      DBT_ACCOUNT_ID: ${{ secrets.DBT_ACCOUNT_ID }}
-      DBT_PROJECT_ID: ${{ secrets.DBT_PROJECT_ID }}
+      DBT_DISCOVERY_URL: ${{ secrets.DBT_DISCOVERY_URL }}
       DBT_TOKEN: ${{ secrets.DBT_TOKEN }}
-      DBT_JOB_IDS_CSV: ${{ secrets.DBT_JOB_IDS_CSV }}          # e.g. "12345,67890"
-      FAILURE_GRACE_MIN: "10"                                  # ignore very fresh failures <10m
-      DEGRADE_THRESHOLD_MIN: "30"                              # call it "Outage" if nothing green for >30m
-      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}          # bot oauth token with chat:write
-      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}        # e.g. C06ABCDE1F2
-      SLACK_STATUS_TS: ${{ secrets.SLACK_STATUS_TS }}          # ts of the pinned status message
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}      # incoming webhook URL for the feed channel
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DBT_JOB_IDS_CSV: ${{ secrets.DBT_JOB_IDS_CSV }}        # e.g. "12345,67890"
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+      SLACK_STATUS_TS: ${{ secrets.SLACK_STATUS_TS }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Check dbt Cloud latest runs
+      - name: Query Discovery API for latest job runs
         id: check
         run: |
           set -euo pipefail
           python - << 'PY'
-          import os, json, time, urllib.request, datetime, math
+          import os, json, time, urllib.request, urllib.error
 
-          token   = os.environ["DBT_TOKEN"]
-          account = os.environ["DBT_ACCOUNT_ID"]
-          project = os.environ["DBT_PROJECT_ID"]
-          job_ids = [j.strip() for j in os.environ["DBT_JOB_IDS_CSV"].split(",") if j.strip()]
-          grace_min    = int(os.environ.get("FAILURE_GRACE_MIN","10"))
-          degrade_min  = int(os.environ.get("DEGRADE_THRESHOLD_MIN","30"))
+          discovery_url = os.environ["DBT_DISCOVERY_URL"]
+          token         = os.environ["DBT_TOKEN"]
+          job_ids       = [j.strip() for j in os.environ["DBT_JOB_IDS_CSV"].split(",") if j.strip()]
 
-          headers = {
-              "Authorization": f"Token {token}",
-              "Content-Type": "application/json",
+          # GraphQL query:
+          # We ask for the most recent run (limit:1, sort desc) for each job ID.
+          # Adjust field / arg names if your schema differs.
+          #
+          # Expected response shape:
+          # {
+          #   "data": {
+          #     "jobRuns": [
+          #        { "jobId": "12345", "status": "success", "finishedAt": "2025-10-27T01:23:45Z" },
+          #        ...
+          #     ]
+          #   }
+          # }
+          #
+          # status values we treat as success: "success", "completed"
+          # anything else -> degraded
+
+          gql_query = """
+          query LatestJobRuns($jobIds: [ID!]!) {
+            jobRuns(jobIds: $jobIds, limit: 1, orderBy: FINISHED_AT_DESC) {
+              jobId
+              status
+              finishedAt
+            }
           }
-          base = f"https://cloud.getdbt.com/api/v2/accounts/{account}"
+          """
 
-          # We'll build:
-          # runs_info = [{job_id, status_code, finished_ts, finished_age_min}]
-          runs_info = []
-          now = time.time()
+          payload = {
+              "query": gql_query,
+              "variables": {
+                  "jobIds": job_ids
+              }
+          }
 
-          def to_ts(dt_str):
-              if not dt_str:
-                  return None
-              # dbt Cloud returns e.g. "2025-01-01T12:34:56Z"
-              return datetime.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ").timestamp()
+          req = urllib.request.Request(
+              discovery_url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Token {token}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
 
-          for jid in job_ids:
-              url = f"{base}/runs/?job_definition_id={jid}&project_id={project}&order_by=-finished_at&include_related=['job']&limit=1"
-              req = urllib.request.Request(url, headers=headers)
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      data = json.loads(r.read().decode())
-              except Exception as e:
-                  runs_info.append({
-                      "job_id": jid,
-                      "status_code": None,
-                      "finished_ts": None,
-                      "finished_age_min": None,
-                      "note": f"API error {e}"
-                  })
-                  continue
-
-              items = data.get("data", [])
-              if not items:
-                  runs_info.append({
-                      "job_id": jid,
-                      "status_code": None,
-                      "finished_ts": None,
-                      "finished_age_min": None,
-                      "note": "no runs found"
-                  })
-                  continue
-
-              run = items[0]
-              status = run.get("status")      # 10=success, 20=error, 30=cancelled
-              f_at   = run.get("finished_at") # string or None
-              ts     = to_ts(f_at)
-              age_min = None
-              if ts:
-                  age_min = (now - ts) / 60.0
-
-              runs_info.append({
-                  "job_id": jid,
-                  "status_code": status,
-                  "finished_ts": ts,
-                  "finished_age_min": age_min,
-                  "note": ""
+          try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  raw = r.read().decode()
+          except urllib.error.HTTPError as e:
+              # bubble up a clean failure so we can see it in Slack
+              raw = json.dumps({
+                  "error": f"HTTP {e.code}",
+                  "body": e.read().decode(errors="replace"),
               })
 
-          # Determine health
-          # rule:
-          # - If ANY job has status !=10 AND finished_age_min > grace_min => degraded
-          # - If ALL jobs are success (10) in last run => operational
-          # Outage heuristic:
-          # - If no successful run (status 10) in ANY job in > degrade_min minutes => outage
+          # Parse
+          try:
+              resp = json.loads(raw)
+          except json.JSONDecodeError:
+              resp = {"error": "non-json response", "body": raw}
 
-          degraded_jobs = []
-          last_success_age_min = math.inf
+          runs = []
+          any_bad = False
+          debug_lines = []
 
-          for info in runs_info:
-              st = info["status_code"]
-              age = info["finished_age_min"]
+          # Defensive parse
+          data = resp.get("data", {})
+          api_runs = data.get("jobRuns", [])
 
-              if st == 10 and age is not None:
-                  last_success_age_min = min(last_success_age_min, age)
+          # Build a dict {jobId: runInfo} because API may return multiple entries or none
+          latest_by_job = {}
+          for run in api_runs:
+              jid   = str(run.get("jobId"))
+              stat  = run.get("status")
+              f_at  = run.get("finishedAt")
+              # first (limit:1) should already be latest, but guard anyway:
+              if jid not in latest_by_job:
+                  latest_by_job[jid] = {"status": stat, "finishedAt": f_at}
 
-              # mark degraded if explicit failure and old enough to matter
-              if st not in (10, None) and (age is None or age > grace_min):
-                  degraded_jobs.append(info["job_id"])
+          # Ensure we record something for every requested job ID
+          for jid in job_ids:
+              info = latest_by_job.get(jid)
+              if info is None:
+                  debug_lines.append(f"job {jid}: no run data")
+                  any_bad = True
+              else:
+                  stat = info["status"]
+                  f_at = info["finishedAt"]
+                  debug_lines.append(f"job {jid}: status={stat} finished_at={f_at}")
+                  norm = (stat or "").lower()
+                  if norm not in ("success", "succeeded", "complete", "completed"):
+                      any_bad = True
 
-              # also if API error / no run treat as degraded
-              if st is None:
-                  degraded_jobs.append(info["job_id"])
+          overall = "Operational"
+          if any_bad:
+              overall = "Degraded"
 
-          if last_success_age_min == math.inf:
-              last_success_age_min = None
+          summary = f"dbt status: {overall}"
+          detail  = "\\n".join(debug_lines)
 
-          # classify overall_status
-          if last_success_age_min is None or (last_success_age_min > degrade_min and len(degraded_jobs) > 0):
-              overall_status = "Outage"
-          elif len(degraded_jobs) > 0:
-              overall_status = "Degraded"
-          else:
-              overall_status = "Operational"
+          # surface internal API errors too (401 etc)
+          if "error" in resp:
+              overall = "Degraded"
+              summary = f"dbt status: {overall} (discovery api error {resp['error']})"
+              detail  = detail + "\\n[discovery_api_error]\\n" + json.dumps(resp, indent=2)[:800]
 
-          # human summary string
-          def fmt_minutes(v):
-              if v is None:
-                  return "unknown"
-              return f"{int(v)}m ago"
-
-          detail_lines = []
-          for info in runs_info:
-              detail_lines.append(
-                  f"job {info['job_id']}: status={info['status_code']} age={fmt_minutes(info['finished_age_min'])} {info['note']}"
-              )
-
-          summary = (
-              f"overall_status={overall_status}; "
-              f"last_success_age={fmt_minutes(last_success_age_min)}; "
-              f"degraded_jobs={','.join(degraded_jobs) if degraded_jobs else 'none'}"
-          )
-          details = "\n".join(detail_lines)
-
-          # expose to later steps
-          print(f"::set-output name=overall_status::{overall_status}")
+          # Emit outputs for downstream steps
+          # set-output is deprecated but still works for simple multi-step jobs
+          print(f"::set-output name=overall::{overall}")
           print(f"::set-output name=summary::{summary}")
-          print(f"::set-output name=details::{details}")
+          print(f"::set-output name=detail::{detail}")
           PY
 
-      - name: Update pinned Slack status message (dashboard tile)
-        # always run so channel always reflects latest state
+      - name: Update pinned Slack status message
         run: |
-          STATUS="${{ steps.check.outputs.overall_status }}"
-          SUMMARY="${{ steps.check.outputs.summary }}"
-          DETAILS="${{ steps.check.outputs.details }}"
-
-          TEXT="dbt status: ${STATUS}\n${SUMMARY}\n(updated by GitHub Actions)"
-
+          TEXT="${{ steps.check.outputs.summary }}\n(updated by GitHub Actions)"
           curl -X POST \
             -H "Content-type: application/json; charset=utf-8" \
             -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
@@ -179,29 +156,19 @@ jobs:
             }" \
             https://slack.com/api/chat.update
 
-      - name: Send feed message on degraded/outage
-        if: steps.check.outputs.overall_status != 'Operational'
+      - name: Send feed message
         run: |
+          STATUS="${{ steps.check.outputs.overall }}"
           SUMMARY="${{ steps.check.outputs.summary }}"
-          DETAILS="${{ steps.check.outputs.details }}"
+          DETAIL="${{ steps.check.outputs.detail }}"
+          if [ "$STATUS" = "Operational" ]; then
+            ICON=":white_check_mark:"
+          else
+            ICON=":warning:"
+          fi
           PAYLOAD=$(cat <<EOF
           {
-            "text": ":warning: dbt degraded/outage\n${SUMMARY}\n\`\`\`${DETAILS}\`\`\`"
-          }
-          EOF
-          )
-          curl -X POST \
-            -H 'Content-type: application/json' \
-            --data "$PAYLOAD" \
-            "$SLACK_WEBHOOK_URL"
-
-      - name: Send feed message on recovery
-        if: steps.check.outputs.overall_status == 'Operational'
-        run: |
-          SUMMARY="${{ steps.check.outputs.summary }}"
-          PAYLOAD=$(cat <<EOF
-          {
-            "text": ":white_check_mark: dbt recovered\n${SUMMARY}"
+            "text": "${ICON} ${SUMMARY}\n\`\`\`${DETAIL}\`\`\`"
           }
           EOF
           )
